@@ -2,34 +2,33 @@ FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
 
 WORKDIR /app
 
-# Copiar requirements e instalar
+# Variables de entorno para optimización
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PYTHONUNBUFFERED=1
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar app
 COPY app.py .
 
-# Instalar chromium
-RUN playwright install chromium
-RUN playwright install-deps chromium
+# Instalar solo chromium
+RUN playwright install chromium --with-deps
 
-# Variables de entorno
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-ENV PYTHONUNBUFFERED=1
+# Health check más tolerante
+HEALTHCHECK --interval=60s --timeout=30s --start-period=90s --retries=2 \
+  CMD python -c "import requests; requests.get('http://localhost:10000/health', timeout=10)" || exit 1
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD python -c "import requests; requests.get('http://localhost:10000/health')" || exit 1
-
-# Comando con timeouts más largos
+# Timeouts más largos y keepalive
 CMD ["gunicorn", "app:app", \
      "--bind", "0.0.0.0:10000", \
      "--workers", "1", \
      "--threads", "1", \
-     "--timeout", "120", \
-     "--graceful-timeout", "120", \
-     "--keep-alive", "5", \
+     "--timeout", "150", \
+     "--graceful-timeout", "150", \
+     "--keep-alive", "120", \
      "--worker-class", "sync", \
+     "--preload", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
      "--log-level", "info"]
