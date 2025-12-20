@@ -441,12 +441,15 @@
         }
 
         async function pollJobResult(jobId) {
-            const maxAttempts = 150; // 150 intentos = ~150 segundos (2.5 minutos) - suficiente para 2 consultas con CAPTCHA
+            // Sin límite de intentos - seguir escuchando indefinidamente
             let attempts = 0;
+            let lastStatus = null;
+            let consecutiveErrors = 0;
 
             const interval = setInterval(async () => {
                 attempts++;
-                const progress = Math.min((attempts / maxAttempts) * 100, 95);
+                // Mostrar progreso basado en tiempo transcurrido (máximo 95% hasta completar)
+                const progress = Math.min(95, 10 + (attempts * 0.5)); // Empieza en 10%, sube 0.5% por intento
                 progressFill.style.width = progress + '%';
 
                 try {
@@ -473,14 +476,18 @@
                     if (response.status === 202) {
                         // Todavía procesando
                         let statusText = 'Procesando consulta...';
-                        if (data.status === 'querying_sisben') {
+                        if (data && data.status === 'querying_sisben') {
                             statusText = 'Consultando SISBEN (primera consulta)...';
-                        } else if (data.status === 'solving_captcha') {
+                        } else if (data && data.status === 'solving_captcha') {
                             statusText = 'Resolviendo CAPTCHA de Registraduría...';
-                        } else if (data.status === 'processing') {
+                        } else if (data && data.status === 'processing') {
                             statusText = 'Consultando Registraduría (segunda consulta)...';
-                        } else if (data.mensaje) {
+                        } else if (data && data.status === 'sisben_completed') {
+                            statusText = '✅ SISBEN completado. Consultando Registraduría...';
+                        } else if (data && data.mensaje) {
                             statusText = data.mensaje;
+                        } else {
+                            statusText = `Procesando consulta... (${attempts}s)`;
                         }
                         showStatus(statusText, 'processing');
                     } else if (response.status === 200) {
@@ -501,7 +508,7 @@
                             submitBtn.disabled = false;
                             submitBtn.textContent = 'Consultar Cédula';
                         } else {
-                            // Otro tipo de resultado
+                            // Otro tipo de resultado (error, not_found, etc.)
                             clearInterval(interval);
                             progressBar.classList.remove('show');
                             showResult(data);
@@ -509,27 +516,40 @@
                             submitBtn.textContent = 'Consultar Cédula';
                         }
                     } else if (response.status === 404) {
+                        // Job no encontrado - puede ser que expiró, pero continuar intentando un poco más
+                        if (attempts < 60) {
+                            // Esperar al menos 1 minuto antes de dar por perdido
+                            return;
+                        }
                         clearInterval(interval);
                         progressBar.classList.remove('show');
-                        showStatus('Job no encontrado o expirado', 'error');
+                        showStatus('Job no encontrado o expirado después de 1 minuto', 'error');
                         submitBtn.disabled = false;
                         submitBtn.textContent = 'Consultar Cédula';
                     }
                 } catch (error) {
                     console.error('Error consultando resultado:', error);
-                    // Si es un error de red o parsing, continuar intentando
-                    // Solo mostrar error si es el último intento
-                    if (attempts >= maxAttempts - 5) {
-                        showStatus(`Error: ${error.message}. Reintentando...`, 'error');
+                    consecutiveErrors++;
+                    
+                    // Si hay muchos errores consecutivos, puede ser un problema de red
+                    if (consecutiveErrors >= 10) {
+                        showStatus(`Error de conexión: ${error.message}. Reintentando... (${attempts} intentos)`, 'error');
+                        consecutiveErrors = 0; // Reset para no saturar
                     }
+                    
+                    // Continuar intentando indefinidamente - no detener el polling
                 }
-
-                if (attempts >= maxAttempts) {
-                    clearInterval(interval);
-                    progressBar.classList.remove('show');
-                    showStatus('⏱️ Tiempo de espera agotado (2.5 minutos). El proceso puede estar aún ejecutándose. Intenta consultar el resultado manualmente usando el job_id.', 'error');
-                    submitBtn.disabled = false;
-                    submitBtn.textContent = 'Consultar Cédula';
+                
+                // Reset contador de errores si la petición fue exitosa
+                if (response && (response.ok || response.status === 202 || response.status === 200)) {
+                    consecutiveErrors = 0;
+                }
+                
+                // Mostrar tiempo transcurrido cada 30 segundos
+                if (attempts % 30 === 0 && attempts > 0) {
+                    const minutos = Math.floor(attempts / 60);
+                    const segundos = attempts % 60;
+                    console.log(`⏱️ Tiempo transcurrido: ${minutos}m ${segundos}s - Continuando...`);
                 }
             }, 1000);
         }
