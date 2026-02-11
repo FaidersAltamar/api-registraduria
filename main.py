@@ -11,10 +11,13 @@ Ejecutar: python main.py
 
 import os
 
-# Cargar .env si existe
+# Cargar .env desde el directorio del script
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    _dir = os.path.dirname(os.path.abspath(__file__))
+    load_dotenv(os.path.join(_dir, '.env'))
+    if not os.getenv('TWOCAPTCHA_API_KEY'):
+        load_dotenv(os.path.join(_dir, '.env.example'))
 except ImportError:
     pass
 
