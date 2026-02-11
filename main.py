@@ -26,6 +26,7 @@ import time
 import logging
 import signal
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Dict, Any, List
 
 # Configuración
@@ -38,6 +39,8 @@ BASE_URL = "https://eleccionescolombia.registraduria.gov.co/identificacion"
 SITE_KEY = "6Lc9DmgrAAAAAJAjWVhjDy1KSgqzqJikY5z7I9SV"
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+MAX_WORKERS = 10
 
 logging.basicConfig(
     level=logging.INFO,
@@ -199,6 +202,13 @@ def enviar_resultado(cola_id: str, cedula: str, exito: bool, datos: Optional[Dic
         return False
 
 
+def procesar_consulta(consulta: Dict) -> tuple:
+    """Worker: consulta Registraduria. Retorna (consulta, resultado)."""
+    cedula = consulta['cedula']
+    resultado = query_registraduria(cedula)
+    return (consulta, resultado)
+
+
 def main():
     """Loop principal: obtener pendientes -> consultar -> enviar"""
     if not TWOCAPTCHA_API_KEY:
@@ -220,38 +230,39 @@ def main():
         try:
             consultas = obtener_consultas_pendientes(tipo='registraduria', limit=10)
 
-            for c in consultas:
-                if not running:
-                    break
-                cedula = c['cedula']
-                cola_id = c['id']
-                logger.info(f"Procesando cedula: {cedula}")
-
-                resultado = query_registraduria(cedula)
-
-                if resultado and resultado.get('status') == 'not_found':
-                    enviar_resultado(cola_id, cedula, False, error='Cedula no encontrada')
-                elif resultado and any(v for k, v in resultado.items() if k != 'status' and v):
-                    datos = {
-                        'municipio_votacion': resultado.get('municipio'),
-                        'departamento_votacion': resultado.get('departamento'),
-                        'puesto_votacion': resultado.get('puesto'),
-                        'direccion_puesto': resultado.get('direccion'),
-                        'mesa': resultado.get('mesa'),
-                        'zona_votacion': resultado.get('zona'),
-                    }
-                    datos = {k: v for k, v in datos.items() if v is not None}
-                    enviar_resultado(cola_id, cedula, True, datos=datos)
-                else:
-                    enviar_resultado(cola_id, cedula, False, error='No se encontraron datos')
-
-                time.sleep(2)
+            if consultas:
+                with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    futures = {executor.submit(procesar_consulta, c): c for c in consultas}
+                    for future in as_completed(futures):
+                        if not running:
+                            executor.shutdown(wait=False, cancel_futures=True)
+                            break
+                        try:
+                            consulta, resultado = future.result()
+                            cola_id = consulta['id']
+                            cedula = consulta['cedula']
+                            if resultado and resultado.get('status') == 'not_found':
+                                enviar_resultado(cola_id, cedula, False, error='Cedula no encontrada')
+                            elif resultado and any(v for k, v in resultado.items() if k != 'status' and v):
+                                datos = {
+                                    'municipio_votacion': resultado.get('municipio'),
+                                    'departamento_votacion': resultado.get('departamento'),
+                                    'puesto_votacion': resultado.get('puesto'),
+                                    'direccion_puesto': resultado.get('direccion'),
+                                    'mesa': resultado.get('mesa'),
+                                    'zona_votacion': resultado.get('zona'),
+                                }
+                                datos = {k: v for k, v in datos.items() if v is not None}
+                                enviar_resultado(cola_id, cedula, True, datos=datos)
+                            else:
+                                enviar_resultado(cola_id, cedula, False, error='No se encontraron datos')
+                        except Exception as e:
+                            logger.error(f"Error procesando consulta: {e}")
+                time.sleep(5)
 
             if not consultas:
                 logger.info("Sin consultas. Esperando 30s...")
                 time.sleep(30)
-            else:
-                time.sleep(5)
 
         except KeyboardInterrupt:
             break
