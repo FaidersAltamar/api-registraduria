@@ -9,4 +9,4 @@ COPY main.py .
 
 ENV PYTHONUNBUFFERED=1
 
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "while true; do python main.py; echo 'Reiniciando en 5s...'; sleep 5; done"]

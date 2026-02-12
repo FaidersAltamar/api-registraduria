@@ -23,7 +23,9 @@ except ImportError:
 
 import sys
 import time
+import random
 import logging
+import json
 import signal
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -40,13 +42,41 @@ SITE_KEY = "6Lc9DmgrAAAAAJAjWVhjDy1KSgqzqJikY5z7I9SV"
 
 USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 
-MAX_WORKERS = 10
+MAX_WORKERS = 3
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def _parse_2captcha_json(resp: requests.Response) -> Optional[Dict]:
+    """Parsea JSON de 2Captcha manejando respuestas mal formadas."""
+    if resp.status_code != 200:
+        logger.warning(f"2Captcha HTTP {resp.status_code}: {resp.text[:100]}")
+        return None
+    try:
+        return resp.json()
+    except json.JSONDecodeError as e:
+        logger.warning(f"2Captcha JSON invalido: {e}. Raw: {resp.text[:200]}")
+        # Intentar extraer primer objeto JSON si hay multiples concatenados
+        text = resp.text.strip()
+        depth = 0
+        start = -1
+        for i, c in enumerate(text):
+            if c == '{':
+                if depth == 0:
+                    start = i
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except json.JSONDecodeError:
+                        pass
+        return None
 
 
 def solve_recaptcha(site_key: str, page_url: str) -> Optional[str]:
@@ -64,7 +94,9 @@ def solve_recaptcha(site_key: str, page_url: str) -> Optional[str]:
             'json': 1
         }, timeout=10)
 
-        r = resp.json()
+        r = _parse_2captcha_json(resp)
+        if r is None:
+            return None
         if r.get('status') != 1:
             logger.error(f"Error 2Captcha: {r}")
             return None
@@ -72,13 +104,15 @@ def solve_recaptcha(site_key: str, page_url: str) -> Optional[str]:
         captcha_id = r.get('request')
         logger.info(f"CAPTCHA enviado, ID: {captcha_id}")
 
-        for attempt in range(40):
+        for attempt in range(50):
             time.sleep(1.5 if attempt < 10 else 2)
             resp = requests.get('http://2captcha.com/res.php', params={
                 'key': TWOCAPTCHA_API_KEY,
                 'action': 'get', 'id': captcha_id, 'json': 1
             }, timeout=10)
-            r = resp.json()
+            r = _parse_2captcha_json(resp)
+            if r is None:
+                continue  # reintentar en siguiente iteracion
             if r.get('status') == 1:
                 logger.info(f"CAPTCHA resuelto (intento {attempt + 1})")
                 return r.get('request')
@@ -117,8 +151,28 @@ def query_registraduria(cedula: str) -> Optional[Dict[str, Any]]:
             "platform": "web"
         }
 
-        resp = requests.post(API_URL, json=payload, headers=headers, timeout=15)
-        resp.raise_for_status()
+        # Retry: 404 una vez (10s), 403 hasta 2 veces (10s, 20s), 500 hasta 2 veces (10s, 15s)
+        resp = None
+        for intento in range(3):
+            resp = requests.post(API_URL, json=payload, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                break
+            if resp.status_code == 404 and intento == 0:
+                logger.warning("API 404, reintentando en 10s...")
+                time.sleep(10)
+                continue
+            if resp.status_code == 403 and intento < 2:
+                delay = 10 * (2 ** intento)  # 10s, 20s
+                logger.warning(f"API 403, reintentando en {delay}s...")
+                time.sleep(delay)
+                continue
+            if resp.status_code == 500 and intento < 2:
+                delay = 10 + (5 * intento)  # 10s, 15s
+                logger.warning(f"API 500, reintentando en {delay}s...")
+                time.sleep(delay)
+                continue
+            resp.raise_for_status()
+
         data = resp.json()
 
         if data.get('status') is False and data.get('status_code') == 13:
@@ -155,7 +209,15 @@ def query_registraduria(cedula: str) -> Optional[Dict[str, Any]]:
         }
     except requests.RequestException as e:
         logger.error(f"Error API: {e}")
-        return None
+        if hasattr(e, 'response') and e.response is not None:
+            code = e.response.status_code
+            if code == 404:
+                return {"status": "api_error", "error": "API no disponible (404)"}
+            if code == 403:
+                return {"status": "api_error", "error": "API no disponible (403 Forbidden)"}
+            if code == 500:
+                return {"status": "api_error", "error": "API no disponible (500)"}
+        return {"status": "api_error", "error": str(e)}
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
         return None
@@ -204,6 +266,7 @@ def enviar_resultado(cola_id: str, cedula: str, exito: bool, datos: Optional[Dic
 
 def procesar_consulta(consulta: Dict) -> tuple:
     """Worker: consulta Registraduria. Retorna (consulta, resultado)."""
+    time.sleep(random.uniform(0, 3))  # espaciar peticiones
     cedula = consulta['cedula']
     resultado = query_registraduria(cedula)
     return (consulta, resultado)
@@ -228,7 +291,7 @@ def main():
 
     while running:
         try:
-            consultas = obtener_consultas_pendientes(tipo='registraduria', limit=10)
+            consultas = obtener_consultas_pendientes(tipo='registraduria', limit=5)
 
             if consultas:
                 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -241,7 +304,9 @@ def main():
                             consulta, resultado = future.result()
                             cola_id = consulta['id']
                             cedula = consulta['cedula']
-                            if resultado and resultado.get('status') == 'not_found':
+                            if resultado and resultado.get('status') == 'api_error':
+                                enviar_resultado(cola_id, cedula, False, error=resultado.get('error', 'Error API'))
+                            elif resultado and resultado.get('status') == 'not_found':
                                 enviar_resultado(cola_id, cedula, False, error='Cedula no encontrada')
                             elif resultado and any(v for k, v in resultado.items() if k != 'status' and v):
                                 datos = {
